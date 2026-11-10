@@ -1,0 +1,107 @@
+name: CI & Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # 모든 푸시·PR: 타입 검사와 단위 테스트
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: Type check & unit tests
+        run: |
+          npm run typecheck
+          npm test
+
+  # main 푸시 + Firebase 설정(Secrets)이 등록된 경우에만 빌드·배포
+  build:
+    needs: test
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      # Firebase 웹 클라이언트 설정은 공개되는 값이지만, 저장소에 남기지 않고 Secrets로 주입합니다.
+      # ⚠️ 비밀번호·서비스 계정 키 같은 진짜 비밀값은 절대 빌드에 주입하지 마세요 (빌드된 JS는 공개됩니다).
+      VITE_FIREBASE_API_KEY: ${{ secrets.VITE_FIREBASE_API_KEY }}
+      VITE_FIREBASE_AUTH_DOMAIN: ${{ secrets.VITE_FIREBASE_AUTH_DOMAIN }}
+      VITE_FIREBASE_PROJECT_ID: ${{ secrets.VITE_FIREBASE_PROJECT_ID }}
+      VITE_FIREBASE_STORAGE_BUCKET: ${{ secrets.VITE_FIREBASE_STORAGE_BUCKET }}
+      VITE_FIREBASE_MESSAGING_SENDER_ID: ${{ secrets.VITE_FIREBASE_MESSAGING_SENDER_ID }}
+      VITE_FIREBASE_APP_ID: ${{ secrets.VITE_FIREBASE_APP_ID }}
+      VITE_ADMIN_EMAIL: ${{ secrets.VITE_ADMIN_EMAIL }}
+      VITE_ADMIN_UID: ${{ secrets.VITE_ADMIN_UID }}
+    outputs:
+      configured: ${{ steps.check.outputs.configured }}
+    steps:
+      - id: check
+        name: Check Firebase settings
+        run: |
+          if [ -n "$VITE_FIREBASE_PROJECT_ID" ]; then
+            echo "configured=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "::notice::Firebase Secrets가 없어 배포를 건너뜁니다 (테스트는 통과)."
+            echo "configured=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - if: steps.check.outputs.configured == 'true'
+        uses: actions/checkout@v5
+      - if: steps.check.outputs.configured == 'true'
+        uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+      - if: steps.check.outputs.configured == 'true'
+        run: npm ci
+
+      - name: Build
+        if: steps.check.outputs.configured == 'true'
+        run: npx vite build
+
+      - name: Verify build output
+        if: steps.check.outputs.configured == 'true'
+        run: |
+          test -f dist/index.html
+          if grep -q 'src/main.tsx' dist/index.html; then echo "::error::dist/index.html 이 빌드되지 않은 원본입니다"; exit 1; fi
+          grep -qF "$VITE_FIREBASE_PROJECT_ID" dist/assets/*.js || { echo "::error::Firebase 설정이 빌드에 포함되지 않았습니다"; exit 1; }
+
+      - name: Guard against leaked server secrets
+        if: steps.check.outputs.configured == 'true'
+        run: |
+          if grep -rEl "BEGIN (RSA )?PRIVATE KEY|\"private_key\"|client_secret" dist; then
+            echo "::error::빌드 결과물에 비밀키로 보이는 문자열이 있습니다. 배포를 중단합니다."
+            exit 1
+          fi
+
+      - if: steps.check.outputs.configured == 'true'
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: dist
+
+  deploy:
+    needs: build
+    if: needs.build.outputs.configured == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
